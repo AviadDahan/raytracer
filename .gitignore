@@ -7,3 +7,8 @@ __pycache__/
 *.pywz
 *.pyzw
 *.pyz
+.DS_Store
+.vscode/
+.idea/
+.pytest_cache/
+.pytest_cache/

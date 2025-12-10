@@ -319,18 +319,27 @@ def render(camera, scene_settings, materials, surfaces, lights, width, height):
     """
     Render the scene to an image array.
     """
+    import sys
+    import time
+    
     # Setup camera
     aspect_ratio = width / height
     camera.setup(aspect_ratio)
+    print(f"Camera setup complete. Forward: {camera.forward}, Right: {camera.right}, Up: {camera.up}")
     
     # Pre-allocate image array
     image = np.zeros((height, width, 3), dtype=np.float64)
     
     max_depth = int(scene_settings.max_recursions)
+    n_shadow = int(scene_settings.root_number_shadow_rays)
+    print(f"Max depth: {max_depth}, Shadow rays: {n_shadow}x{n_shadow}={n_shadow*n_shadow} per light")
     
     # Render each pixel
     total_pixels = width * height
+    start_time = time.time()
+    
     for y in range(height):
+        row_start = time.time()
         for x in range(width):
             # Generate ray for this pixel
             ray_origin, ray_direction = camera.generate_ray(x, y, width, height)
@@ -341,10 +350,17 @@ def render(camera, scene_settings, materials, surfaces, lights, width, height):
             
             image[y, x] = color
         
-        # Progress indicator
-        if (y + 1) % 50 == 0 or y == height - 1:
-            progress = ((y + 1) * width) / total_pixels * 100
-            print(f"Rendering: {progress:.1f}% complete")
+        # Progress indicator every 10 rows
+        if (y + 1) % 10 == 0 or y == height - 1:
+            elapsed = time.time() - start_time
+            progress = (y + 1) / height
+            eta = (elapsed / progress) * (1 - progress) if progress > 0 else 0
+            row_time = time.time() - row_start
+            print(f"Row {y+1}/{height} ({progress*100:.1f}%) - Row time: {row_time:.2f}s - ETA: {eta:.0f}s")
+            sys.stdout.flush()
+    
+    total_time = time.time() - start_time
+    print(f"Rendering complete in {total_time:.1f}s")
     
     return image
 
