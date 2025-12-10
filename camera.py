@@ -43,7 +43,7 @@ class Camera:
         """
         # Convert pixel coordinates to normalized screen coordinates [-0.5, 0.5]
         # Center of pixel
-        px = (x + 0.5) / image_width - 0.5   # ranges from -0.5 to 0.5
+        px = 0.5 - (x + 0.5) / image_width   # flip x, ranges from -0.5 to 0.5
         py = 0.5 - (y + 0.5) / image_height  # flip y, ranges from -0.5 to 0.5
         
         # Scale to screen dimensions
