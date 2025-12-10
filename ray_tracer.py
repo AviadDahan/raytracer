@@ -1074,8 +1074,8 @@ def main():
     parser.add_argument('--height', type=int, default=500, help='Image height')
     parser.add_argument('--sequential', action='store_true', 
                         help='Use sequential (non-vectorized) renderer')
-    parser.add_argument('--parallel', action='store_true',
-                        help='Use parallel multiprocessing renderer')
+    parser.add_argument('--vectorized', action='store_true',
+                        help='Use single-threaded vectorized renderer')
     parser.add_argument('--workers', type=int, default=None,
                         help='Number of worker processes (default: CPU count)')
     args = parser.parse_args()
@@ -1089,20 +1089,21 @@ def main():
     print(f"Scene loaded: {len(materials)} materials, {len(surfaces)} surfaces, {len(lights)} lights")
     print(f"Rendering {args.width}x{args.height} image...")
     
-    # Choose renderer
+    # Choose renderer (parallel is default)
     if args.sequential:
         print("Using sequential (original) renderer...")
         image_array = render(camera, scene_settings, materials, surfaces, lights, 
                             args.width, args.height)
-    elif args.parallel:
+    elif args.vectorized:
+        print("Using vectorized (single-threaded) renderer...")
+        image_array = render_vectorized(camera, scene_settings, materials, surfaces, lights, 
+                                        args.width, args.height)
+    else:
+        # Default: parallel rendering
         num_workers = args.workers if args.workers else mp.cpu_count()
         print(f"Using parallel renderer with {num_workers} workers...")
         image_array = render_parallel(camera, scene_settings, materials, surfaces, lights, 
                                       args.width, args.height, num_workers)
-    else:
-        print("Using vectorized renderer...")
-        image_array = render_vectorized(camera, scene_settings, materials, surfaces, lights, 
-                                        args.width, args.height)
     
     # Save the output image
     save_image(image_array, args.output_image)

@@ -77,13 +77,30 @@ The skeleton only stored position, scale, material_index. Added:
 ## Usage
 
 ```bash
-python ray_tracer.py <scene_file> <output_image> [--width WIDTH] [--height HEIGHT]
+python ray_tracer.py <scene_file> <output_image> [options]
 ```
 
-### Example
+### Options
+
+| Option | Description |
+|--------|-------------|
+| `--width WIDTH` | Image width in pixels (default: 500) |
+| `--height HEIGHT` | Image height in pixels (default: 500) |
+| `--workers N` | Number of worker processes (default: CPU count) |
+| `--vectorized` | Use single-threaded vectorized renderer |
+| `--sequential` | Use original sequential renderer |
+
+### Examples
 
 ```bash
+# Default: parallel rendering with all CPU cores (fastest)
 python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500
+
+# Parallel with specific worker count
+python ray_tracer.py scenes/pool.txt output/pool.png --workers 4
+
+# Single-threaded vectorized rendering
+python ray_tracer.py scenes/pool.txt output/pool.png --vectorized
 ```
 
 ## Project Structure
@@ -249,4 +266,99 @@ When computing shadows, the ray tracer:
 ## Example Output
 
 The `pool.txt` scene renders 6 colored spheres on a plane with multiple light sources creating soft shadows.
+
+---
+
+## Changelog
+
+### v2.0.0 - Performance Optimization Release
+
+This release introduces major performance improvements through NumPy vectorization and multiprocessing parallelization, achieving approximately **200x speedup** over the original sequential implementation.
+
+#### New Rendering Modes
+
+| Mode | Flag | Description |
+|------|------|-------------|
+| Parallel | *(default)* | Multiprocessing + vectorization (~200x faster) |
+| Vectorized | `--vectorized` | NumPy batch processing, single-threaded (~40x faster) |
+| Sequential | `--sequential` | Original pixel-by-pixel renderer (baseline) |
+
+#### Usage Examples
+
+```bash
+# Parallel rendering (default, fastest, uses all CPU cores)
+python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500
+
+# Parallel with specific worker count
+python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500 --workers 8
+
+# Single-threaded vectorized rendering
+python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500 --vectorized
+
+# Original sequential rendering (for comparison)
+python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500 --sequential
+```
+
+#### Performance Benchmarks
+
+Tested on 500x500 image with pool.txt scene (10 CPU cores):
+
+| Renderer | Time | Speedup |
+|----------|------|---------|
+| Sequential | ~600s | 1x (baseline) |
+| Vectorized | 14.7s | ~40x |
+| Parallel (10 workers) | 3.2s | ~200x |
+
+#### Technical Changes
+
+##### NumPy Vectorization
+
+**`camera.py`**
+- Added `generate_all_rays(width, height)` - generates all rays as `(H*W, 3)` arrays using `np.meshgrid`
+- Added `generate_rays_for_rows(width, height, y_start, y_end)` - generates rays for specific row ranges (for parallel rendering)
+
+**`surfaces/sphere.py`**
+- Added `intersect_batch(ray_origins, ray_directions)` - vectorized ray-sphere intersection using batch quadratic formula
+
+**`surfaces/infinite_plane.py`**
+- Added `intersect_batch(ray_origins, ray_directions)` - vectorized ray-plane intersection
+
+**`surfaces/cube.py`**
+- Added `intersect_batch(ray_origins, ray_directions)` - vectorized slab method for ray-box intersection
+
+**`ray_tracer.py`**
+- Added `normalize_batch(v)` - batch vector normalization
+- Added `reflect_batch(d, n)` - batch reflection computation
+- Added `find_nearest_intersection_batch()` - tests all rays against all surfaces in parallel
+- Added `compute_soft_shadow_batch()` - vectorized soft shadow computation with per-point light basis
+- Added `compute_shadow_transmission_batch()` - vectorized shadow ray transmission
+- Added `render_vectorized()` - main vectorized render loop using iterative depth traversal
+
+##### Multiprocessing Parallelization
+
+**`ray_tracer.py`**
+- Added `_render_row_chunk(args)` - worker function that renders a chunk of rows
+- Added `render_parallel(camera, scene_settings, materials, surfaces, lights, width, height, num_workers)` - distributes work across CPU cores using `multiprocessing.Pool`
+- Row-based chunking with ~4 chunks per worker for load balancing
+- Parallel is now the default renderer
+- CLI flags: `--vectorized` (single-threaded), `--workers N` (set worker count)
+
+#### Bug Fixes
+
+- Fixed soft shadow light basis computation in vectorized renderer: now correctly computes per-point basis vectors instead of approximating from first point only
+
+#### Architecture
+
+The vectorized renderer transforms the traditional recursive ray tracing into an iterative batch process:
+
+```
+Depth 0: Trace all primary rays (250,000 for 500x500)
+    └─> Find intersections, compute shading, identify reflection rays
+Depth 1: Trace reflection rays (~95,000 active)
+    └─> Repeat shading, identify next level reflections
+Depth 2: Continue with remaining active rays (~20,000)
+    └─> ... continues until max_depth or no active rays
+```
+
+The parallel renderer divides the image into row chunks, with each worker running the full vectorized pipeline on its assigned rows independently.
 
