@@ -110,3 +110,51 @@ class Camera:
         origins = np.tile(self.position, (num_rays, 1))
         
         return origins, directions
+    
+    def generate_rays_for_rows(self, image_width, image_height, y_start, y_end):
+        """
+        Generate rays for a specific range of rows (for parallel rendering).
+        
+        Args:
+            image_width: full image width
+            image_height: full image height
+            y_start: starting row (inclusive)
+            y_end: ending row (exclusive)
+        
+        Returns:
+            ray_origins: (num_rows * width, 3) array of ray origins
+            ray_directions: (num_rows * width, 3) array of normalized ray directions
+        """
+        num_rows = y_end - y_start
+        
+        # Create pixel coordinate grids for the specified rows
+        x = np.arange(image_width, dtype=np.float64)
+        y = np.arange(y_start, y_end, dtype=np.float64)
+        
+        xx, yy = np.meshgrid(x, y)
+        xx = xx.ravel()
+        yy = yy.ravel()
+        
+        # Convert to normalized screen coordinates
+        px = (xx + 0.5) / image_width - 0.5
+        py = 0.5 - (yy + 0.5) / image_height
+        
+        px *= self.screen_width
+        py *= self.screen_height
+        
+        # Compute screen points
+        screen_center = self.position + self.forward * self.screen_distance
+        screen_points = (screen_center[np.newaxis, :] + 
+                        np.outer(px, self.right) + 
+                        np.outer(py, self.up))
+        
+        # Ray directions
+        directions = screen_points - self.position
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        directions = directions / norms
+        
+        # Ray origins
+        num_rays = num_rows * image_width
+        origins = np.tile(self.position, (num_rays, 1))
+        
+        return origins, directions

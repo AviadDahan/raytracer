@@ -803,6 +803,256 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
     return image
 
 
+def _render_row_chunk(args):
+    """
+    Worker function to render a chunk of rows.
+    Called by multiprocessing pool.
+    
+    Args:
+        args: tuple of (y_start, y_end, camera_data, scene_data)
+    
+    Returns:
+        (y_start, y_end, colors) - the rendered chunk
+    """
+    y_start, y_end, camera_data, scene_data = args
+    
+    # Reconstruct camera from serialized data
+    from camera import Camera
+    camera = Camera(
+        camera_data['position'],
+        camera_data['look_at'],
+        camera_data['up_vector'],
+        camera_data['screen_distance'],
+        camera_data['screen_width']
+    )
+    camera.forward = np.array(camera_data['forward'])
+    camera.right = np.array(camera_data['right'])
+    camera.up = np.array(camera_data['up'])
+    camera.screen_height = camera_data['screen_height']
+    
+    # Extract scene data
+    width = scene_data['width']
+    height = scene_data['height']
+    max_depth = scene_data['max_depth']
+    n_shadow = scene_data['n_shadow']
+    background_color = np.array(scene_data['background_color'])
+    materials_array = scene_data['materials_array']
+    surfaces = scene_data['surfaces']
+    lights = scene_data['lights']
+    
+    # Generate rays for this chunk
+    ray_origins, ray_directions = camera.generate_rays_for_rows(width, height, y_start, y_end)
+    N = ray_origins.shape[0]
+    
+    # Initialize colors and weights
+    colors = np.zeros((N, 3))
+    weights = np.ones((N, 3))
+    
+    current_origins = ray_origins.copy()
+    current_directions = ray_directions.copy()
+    active = np.ones(N, dtype=bool)
+    
+    # Iterative ray tracing
+    for depth in range(max_depth + 1):
+        if not np.any(active):
+            break
+        
+        active_idx = np.where(active)[0]
+        t_values, surface_indices, normals = find_nearest_intersection_batch(
+            current_origins[active_idx],
+            current_directions[active_idx],
+            surfaces
+        )
+        
+        hit_mask_local = surface_indices >= 0
+        miss_idx = active_idx[~hit_mask_local]
+        hit_idx = active_idx[hit_mask_local]
+        
+        colors[miss_idx] += weights[miss_idx] * background_color
+        active[miss_idx] = False
+        
+        if len(hit_idx) == 0:
+            break
+        
+        hit_t = t_values[hit_mask_local]
+        hit_surf_idx = surface_indices[hit_mask_local]
+        hit_normals = normals[hit_mask_local]
+        hit_origins = current_origins[hit_idx]
+        hit_directions = current_directions[hit_idx]
+        
+        hit_points = hit_origins + hit_t[:, np.newaxis] * hit_directions
+        hit_mat_idx = np.array([surfaces[si].material_index - 1 for si in hit_surf_idx])
+        view_dirs = normalize_batch(hit_origins - hit_points)
+        
+        M = len(hit_idx)
+        diffuse = np.zeros((M, 3))
+        specular = np.zeros((M, 3))
+        
+        for light in lights:
+            light_pos = np.array(light.position, dtype=np.float64)
+            light_color = np.array(light.color, dtype=np.float64)
+            
+            to_light = light_pos - hit_points
+            light_dists = np.linalg.norm(to_light, axis=1)
+            light_dirs = to_light / light_dists[:, np.newaxis]
+            
+            shadow_hit_mask = np.ones(M, dtype=bool)
+            temp_mat_idx = np.zeros(M, dtype=np.int32)
+            temp_mat_idx[:] = hit_mat_idx
+            
+            shadow_trans = compute_soft_shadow_batch(
+                hit_points + hit_normals * EPSILON,
+                shadow_hit_mask,
+                light, surfaces, temp_mat_idx, materials_array, n_shadow
+            )
+            
+            light_intensity = ((1 - light.shadow_intensity) + 
+                              light.shadow_intensity * shadow_trans)
+            
+            n_dot_l = np.maximum(0, np.sum(hit_normals * light_dirs, axis=1))
+            mat_diffuse = materials_array['diffuse'][hit_mat_idx]
+            diffuse += mat_diffuse * light_color * (light_intensity * n_dot_l)[:, np.newaxis]
+            
+            reflect_dirs = reflect_batch(-light_dirs, hit_normals)
+            r_dot_v = np.maximum(0, np.sum(reflect_dirs * view_dirs, axis=1))
+            
+            mat_specular = materials_array['specular'][hit_mat_idx]
+            mat_shininess = materials_array['shininess'][hit_mat_idx]
+            
+            spec_contrib = (mat_specular * light_color * light.specular_intensity *
+                           (light_intensity * np.power(r_dot_v, mat_shininess))[:, np.newaxis])
+            specular += spec_contrib
+        
+        mat_transparency = materials_array['transparency'][hit_mat_idx]
+        mat_reflection = materials_array['reflection'][hit_mat_idx]
+        
+        surface_color = (diffuse + specular) * (1 - mat_transparency)[:, np.newaxis]
+        colors[hit_idx] += weights[hit_idx] * surface_color
+        
+        has_reflection = np.any(mat_reflection > EPSILON, axis=1)
+        reflect_idx = hit_idx[has_reflection]
+        has_transparency = mat_transparency > EPSILON
+        
+        no_recurse = ~has_reflection & ~has_transparency
+        active[hit_idx[no_recurse]] = False
+        
+        if len(reflect_idx) > 0 and depth < max_depth:
+            reflect_local_idx = np.where(has_reflection)[0]
+            reflect_dirs = reflect_batch(hit_directions[reflect_local_idx], 
+                                         hit_normals[reflect_local_idx])
+            reflect_origins = hit_points[reflect_local_idx] + hit_normals[reflect_local_idx] * EPSILON
+            
+            current_origins[reflect_idx] = reflect_origins
+            current_directions[reflect_idx] = reflect_dirs
+            weights[reflect_idx] *= mat_reflection[reflect_local_idx]
+        else:
+            active[reflect_idx] = False
+        
+        trans_only = has_transparency & ~has_reflection
+        trans_only_idx = hit_idx[trans_only]
+        
+        if len(trans_only_idx) > 0 and depth < max_depth:
+            trans_local_idx = np.where(trans_only)[0]
+            trans_origins = hit_points[trans_local_idx] - hit_normals[trans_local_idx] * EPSILON
+            
+            current_origins[trans_only_idx] = trans_origins
+            current_directions[trans_only_idx] = hit_directions[trans_local_idx]
+            weights[trans_only_idx] *= mat_transparency[trans_local_idx, np.newaxis]
+            active[trans_only_idx] = True
+    
+    return (y_start, y_end, colors)
+
+
+def render_parallel(camera, scene_settings, materials, surfaces, lights, width, height, num_workers=None):
+    """
+    Render the scene using multiprocessing (parallel row-based rendering).
+    
+    Args:
+        num_workers: number of worker processes (default: CPU count)
+    """
+    import multiprocessing as mp
+    import time
+    
+    if num_workers is None:
+        num_workers = mp.cpu_count()
+    
+    start_time = time.time()
+    
+    # Setup camera
+    aspect_ratio = width / height
+    camera.setup(aspect_ratio)
+    print(f"Camera setup complete. Forward: {camera.forward}, Right: {camera.right}, Up: {camera.up}")
+    
+    max_depth = int(scene_settings.max_recursions)
+    n_shadow = int(scene_settings.root_number_shadow_rays)
+    background_color = np.array(scene_settings.background_color, dtype=np.float64)
+    
+    print(f"Max depth: {max_depth}, Shadow rays: {n_shadow}x{n_shadow}={n_shadow*n_shadow} per light")
+    print(f"Parallel rendering {width}x{height} with {num_workers} workers...")
+    
+    # Serialize camera data for workers
+    camera_data = {
+        'position': camera.position.tolist(),
+        'look_at': camera.look_at.tolist(),
+        'up_vector': camera.up_vector.tolist(),
+        'screen_distance': camera.screen_distance,
+        'screen_width': camera.screen_width,
+        'forward': camera.forward.tolist(),
+        'right': camera.right.tolist(),
+        'up': camera.up.tolist(),
+        'screen_height': camera.screen_height,
+    }
+    
+    # Pre-compute material properties
+    materials_array = {
+        'diffuse': np.array([m.diffuse_color for m in materials]),
+        'specular': np.array([m.specular_color for m in materials]),
+        'reflection': np.array([m.reflection_color for m in materials]),
+        'shininess': np.array([m.shininess for m in materials]),
+        'transparency': np.array([m.transparency for m in materials]),
+    }
+    
+    # Scene data for workers
+    scene_data = {
+        'width': width,
+        'height': height,
+        'max_depth': max_depth,
+        'n_shadow': n_shadow,
+        'background_color': background_color.tolist(),
+        'materials_array': materials_array,
+        'surfaces': surfaces,
+        'lights': lights,
+    }
+    
+    # Divide rows into chunks
+    rows_per_chunk = max(1, height // (num_workers * 4))  # 4 chunks per worker for load balancing
+    chunks = []
+    for y_start in range(0, height, rows_per_chunk):
+        y_end = min(y_start + rows_per_chunk, height)
+        chunks.append((y_start, y_end, camera_data, scene_data))
+    
+    print(f"Divided into {len(chunks)} chunks of ~{rows_per_chunk} rows each")
+    
+    # Process chunks in parallel
+    pool_start = time.time()
+    with mp.Pool(num_workers) as pool:
+        results = pool.map(_render_row_chunk, chunks)
+    
+    print(f"All chunks completed in {time.time() - pool_start:.2f}s")
+    
+    # Assemble final image
+    image = np.zeros((height, width, 3), dtype=np.float64)
+    for y_start, y_end, colors in results:
+        num_rows = y_end - y_start
+        chunk_image = colors.reshape((num_rows, width, 3))
+        image[y_start:y_end] = chunk_image
+    
+    total_time = time.time() - start_time
+    print(f"Parallel rendering complete in {total_time:.1f}s")
+    
+    return image
+
+
 def save_image(image_array, output_path):
     """Save the rendered image to a file."""
     # Clamp values to [0, 1] then scale to [0, 255]
@@ -815,6 +1065,8 @@ def save_image(image_array, output_path):
 
 
 def main():
+    import multiprocessing as mp
+    
     parser = argparse.ArgumentParser(description='Python Ray Tracer')
     parser.add_argument('scene_file', type=str, help='Path to the scene file')
     parser.add_argument('output_image', type=str, help='Name of the output image file')
@@ -822,6 +1074,10 @@ def main():
     parser.add_argument('--height', type=int, default=500, help='Image height')
     parser.add_argument('--sequential', action='store_true', 
                         help='Use sequential (non-vectorized) renderer')
+    parser.add_argument('--parallel', action='store_true',
+                        help='Use parallel multiprocessing renderer')
+    parser.add_argument('--workers', type=int, default=None,
+                        help='Number of worker processes (default: CPU count)')
     args = parser.parse_args()
 
     # Parse the scene file
@@ -838,6 +1094,11 @@ def main():
         print("Using sequential (original) renderer...")
         image_array = render(camera, scene_settings, materials, surfaces, lights, 
                             args.width, args.height)
+    elif args.parallel:
+        num_workers = args.workers if args.workers else mp.cpu_count()
+        print(f"Using parallel renderer with {num_workers} workers...")
+        image_array = render_parallel(camera, scene_settings, materials, surfaces, lights, 
+                                      args.width, args.height, num_workers)
     else:
         print("Using vectorized renderer...")
         image_array = render_vectorized(camera, scene_settings, materials, surfaces, lights, 
