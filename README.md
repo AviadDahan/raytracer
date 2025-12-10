@@ -11,6 +11,69 @@ A Python-based ray tracer implementing the Phong shading model with support for 
 - **Reflections**: Recursive reflection rays with configurable reflection color
 - **Transparency in Shadows (Bonus)**: Light passes through transparent objects proportionally
 
+## Changes from Skeleton Code
+
+The original skeleton provided basic data classes with no ray tracing logic. Below is a summary of all additions and modifications:
+
+### New Files
+
+| File | Description |
+|------|-------------|
+| `requirements.txt` | Dependencies (numpy, pillow) |
+| `README.md` | Project documentation |
+
+### Modified Files
+
+#### `ray_tracer.py`
+The skeleton only had `parse_scene_file()` and a placeholder `main()`. Added:
+- `normalize(v)`, `reflect(d, n)` - Vector utility functions
+- `separate_objects(objects)` - Separates parsed objects by type
+- `find_nearest_intersection()` - Ray-surface intersection testing
+- `compute_soft_shadow()` - N×N grid shadow sampling with jittering
+- `compute_shadow_ray_transmission()` - Transparency-aware shadow rays (bonus)
+- `compute_color()` - Full Phong shading implementation
+- `trace_ray()` - Recursive ray tracing with reflection/transparency
+- `render()` - Main render loop with progress reporting
+- `save_image()` - Fixed to use output path argument (was hardcoded)
+
+#### `camera.py`
+The skeleton only stored constructor parameters. Added:
+- Converted all vectors to `np.array` for efficient math
+- `setup(aspect_ratio)` - Computes orthonormal camera basis (forward, right, up)
+- `generate_ray(x, y, width, height)` - Generates ray through pixel coordinates
+
+#### `surfaces/sphere.py`
+The skeleton only stored position, radius, material_index. Added:
+- Converted position to `np.array`
+- `intersect(ray_origin, ray_direction)` - Quadratic formula intersection, returns (t, normal)
+
+#### `surfaces/infinite_plane.py`
+The skeleton only stored normal, offset, material_index. Added:
+- Converted normal to `np.array` and normalized it
+- `intersect(ray_origin, ray_direction)` - Plane intersection formula, returns (t, normal)
+
+#### `surfaces/cube.py`
+The skeleton only stored position, scale, material_index. Added:
+- Converted position to `np.array`
+- Pre-computed `min_bound` and `max_bound` for efficiency
+- `intersect(ray_origin, ray_direction)` - Slab method intersection, returns (t, normal)
+
+#### `light.py`
+- Converted position and color to `np.array`
+
+#### `material.py`
+- Converted diffuse_color, specular_color, reflection_color to `np.array`
+
+#### `scene_settings.py`
+- Converted background_color to `np.array`
+- Cast shadow rays and max recursions to `int`
+
+### Skeleton Code Preserved
+
+- Scene file parsing logic in `parse_scene_file()` (unchanged)
+- Command-line argument parsing structure (unchanged)
+- Class attribute names and constructor signatures (unchanged)
+
 ## Usage
 
 ```bash
