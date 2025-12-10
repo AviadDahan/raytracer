@@ -264,17 +264,28 @@ def compute_soft_shadow_batch(hit_points, hit_mask, light, surfaces, material_in
         return transmissions
     
     # Soft shadows - sample NxN grid on light plane
-    # Compute light plane basis vectors
-    to_light = light_pos - active_points[0]  # Use first point for basis (approximate)
-    light_dir = to_light / np.linalg.norm(to_light)
+    # Compute per-point light plane basis vectors (M, 3) each
+    to_light = light_pos - active_points  # (M, 3)
+    light_dists = np.linalg.norm(to_light, axis=1, keepdims=True)  # (M, 1)
+    light_dirs = to_light / light_dists  # (M, 3)
     
-    if abs(light_dir[0]) < 0.9:
-        up_ref = np.array([1.0, 0.0, 0.0])
-    else:
-        up_ref = np.array([0.0, 1.0, 0.0])
+    # Choose up reference based on light direction to avoid degeneracy
+    # For each point, use [1,0,0] unless light_dir is nearly parallel to it
+    up_ref = np.zeros((M, 3))
+    use_y = np.abs(light_dirs[:, 0]) >= 0.9
+    up_ref[~use_y] = [1.0, 0.0, 0.0]
+    up_ref[use_y] = [0.0, 1.0, 0.0]
     
-    right = normalize(np.cross(light_dir, up_ref))
-    up = normalize(np.cross(right, light_dir))
+    # Compute right and up vectors for each point
+    # right = normalize(cross(light_dir, up_ref))
+    right = np.cross(light_dirs, up_ref)  # (M, 3)
+    right_norms = np.linalg.norm(right, axis=1, keepdims=True)
+    right = right / np.maximum(right_norms, EPSILON)
+    
+    # up = normalize(cross(right, light_dir))
+    up = np.cross(right, light_dirs)  # (M, 3)
+    up_norms = np.linalg.norm(up, axis=1, keepdims=True)
+    up = up / np.maximum(up_norms, EPSILON)
     
     cell_size = light.radius / n_shadow_rays
     total_samples = n_shadow_rays * n_shadow_rays
@@ -282,23 +293,20 @@ def compute_soft_shadow_batch(hit_points, hit_mask, light, surfaces, material_in
     # Accumulate transmissions
     total_trans = np.zeros(M)
     
-    # Generate all sample offsets at once
-    i_vals = np.arange(n_shadow_rays)
-    j_vals = np.arange(n_shadow_rays)
-    
     for i in range(n_shadow_rays):
         for j in range(n_shadow_rays):
             # Random offset within cell (vectorized random)
             rand_i = np.random.random(M)
             rand_j = np.random.random(M)
             
-            offset_i = -light.radius / 2 + cell_size * (i + rand_i)
-            offset_j = -light.radius / 2 + cell_size * (j + rand_j)
+            offset_i = -light.radius / 2 + cell_size * (i + rand_i)  # (M,)
+            offset_j = -light.radius / 2 + cell_size * (j + rand_j)  # (M,)
             
-            # Sample positions: (M, 3)
+            # Sample positions: per-point basis vectors
+            # sample_pos[k] = light_pos + offset_i[k] * right[k] + offset_j[k] * up[k]
             sample_pos = (light_pos + 
-                         np.outer(offset_i, right) + 
-                         np.outer(offset_j, up))
+                         offset_i[:, np.newaxis] * right + 
+                         offset_j[:, np.newaxis] * up)  # (M, 3)
             
             # Shadow ray directions
             to_sample = sample_pos - active_points
