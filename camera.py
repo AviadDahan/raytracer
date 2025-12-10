@@ -80,8 +80,8 @@ class Camera:
         yy = yy.ravel()
         
         # Convert pixel coordinates to normalized screen coordinates [-0.5, 0.5]
-        px = (xx + 0.5) / image_width - 0.5
-        py = 0.5 - (yy + 0.5) / image_height
+        px = 0.5 - (xx + 0.5) / image_width   # flip x, ranges from -0.5 to 0.5
+        py = 0.5 - (yy + 0.5) / image_height  # flip y, ranges from -0.5 to 0.5
         
         # Scale to screen dimensions
         px *= self.screen_width
@@ -136,8 +136,8 @@ class Camera:
         yy = yy.ravel()
         
         # Convert to normalized screen coordinates
-        px = (xx + 0.5) / image_width - 0.5
-        py = 0.5 - (yy + 0.5) / image_height
+        px = 0.5 - (xx + 0.5) / image_width   # flip x, ranges from -0.5 to 0.5
+        py = 0.5 - (yy + 0.5) / image_height  # flip y, ranges from -0.5 to 0.5
         
         px *= self.screen_width
         py *= self.screen_height
