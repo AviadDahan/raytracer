@@ -59,3 +59,54 @@ class Camera:
         direction = direction / np.linalg.norm(direction)
         
         return self.position, direction
+    
+    def generate_all_rays(self, image_width, image_height):
+        """
+        Generate all rays for the entire image at once (vectorized).
+        
+        Returns:
+            ray_origins: (H*W, 3) array of ray origins (all same, but tiled for convenience)
+            ray_directions: (H*W, 3) array of normalized ray directions
+        """
+        # Create pixel coordinate grids
+        x = np.arange(image_width, dtype=np.float64)
+        y = np.arange(image_height, dtype=np.float64)
+        
+        # Create meshgrid: xx[i,j] = j (column), yy[i,j] = i (row)
+        xx, yy = np.meshgrid(x, y)
+        
+        # Flatten to 1D arrays of shape (H*W,)
+        xx = xx.ravel()
+        yy = yy.ravel()
+        
+        # Convert pixel coordinates to normalized screen coordinates [-0.5, 0.5]
+        px = (xx + 0.5) / image_width - 0.5
+        py = 0.5 - (yy + 0.5) / image_height
+        
+        # Scale to screen dimensions
+        px *= self.screen_width
+        py *= self.screen_height
+        
+        # Compute screen points: (H*W, 3)
+        # screen_center is (3,), we need to broadcast
+        screen_center = self.position + self.forward * self.screen_distance
+        
+        # Build direction vectors using outer products
+        # screen_point = screen_center + right * px + up * py
+        # px and py are (H*W,), right and up are (3,)
+        screen_points = (screen_center[np.newaxis, :] + 
+                        np.outer(px, self.right) + 
+                        np.outer(py, self.up))
+        
+        # Ray directions (H*W, 3)
+        directions = screen_points - self.position
+        
+        # Normalize directions
+        norms = np.linalg.norm(directions, axis=1, keepdims=True)
+        directions = directions / norms
+        
+        # Ray origins: all the same, tile for convenience
+        num_rays = image_width * image_height
+        origins = np.tile(self.position, (num_rays, 1))
+        
+        return origins, directions
