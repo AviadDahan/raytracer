@@ -1,6 +1,7 @@
 import argparse
 from PIL import Image
 import numpy as np
+from numba import njit
 
 from camera import Camera
 from light import Light
@@ -13,6 +14,329 @@ from surfaces.sphere import Sphere
 
 # Small epsilon to avoid self-intersection
 EPSILON = 1e-6
+
+
+# =============================================================================
+# Numba JIT-compiled helper functions for hot paths
+# =============================================================================
+
+@njit(cache=True)
+def _get_material_indices(surface_material_indices, hit_surf_indices):
+    """
+    Get material indices for hit surfaces (JIT-compiled).
+    Replaces: np.array([surfaces[si].material_index - 1 for si in hit_surf_idx])
+    """
+    n = len(hit_surf_indices)
+    result = np.empty(n, dtype=np.int32)
+    for i in range(n):
+        result[i] = surface_material_indices[hit_surf_indices[i]]
+    return result
+
+
+@njit(cache=True)
+def _sphere_intersect_batch(ray_origins, ray_directions, center, radius):
+    """
+    Vectorized sphere intersection (JIT-compiled for speed).
+    """
+    N = ray_origins.shape[0]
+    t_values = np.full(N, np.inf)
+    normals = np.zeros((N, 3))
+    
+    for i in range(N):
+        # Vector from ray origin to sphere center
+        oc_x = ray_origins[i, 0] - center[0]
+        oc_y = ray_origins[i, 1] - center[1]
+        oc_z = ray_origins[i, 2] - center[2]
+        
+        dx = ray_directions[i, 0]
+        dy = ray_directions[i, 1]
+        dz = ray_directions[i, 2]
+        
+        # Quadratic coefficients
+        a = dx*dx + dy*dy + dz*dz
+        b = 2.0 * (oc_x*dx + oc_y*dy + oc_z*dz)
+        c = oc_x*oc_x + oc_y*oc_y + oc_z*oc_z - radius*radius
+        
+        discriminant = b*b - 4*a*c
+        
+        if discriminant >= 0:
+            sqrt_disc = np.sqrt(discriminant)
+            t1 = (-b - sqrt_disc) / (2*a)
+            t2 = (-b + sqrt_disc) / (2*a)
+            
+            if t1 > 1e-6:
+                t = t1
+            elif t2 > 1e-6:
+                t = t2
+            else:
+                continue
+            
+            t_values[i] = t
+            
+            # Compute hit point and normal
+            hit_x = ray_origins[i, 0] + t * dx
+            hit_y = ray_origins[i, 1] + t * dy
+            hit_z = ray_origins[i, 2] + t * dz
+            
+            normals[i, 0] = (hit_x - center[0]) / radius
+            normals[i, 1] = (hit_y - center[1]) / radius
+            normals[i, 2] = (hit_z - center[2]) / radius
+    
+    return t_values, normals
+
+
+@njit(cache=True)
+def _plane_intersect_batch(ray_origins, ray_directions, normal, offset):
+    """
+    Vectorized plane intersection (JIT-compiled for speed).
+    """
+    N = ray_origins.shape[0]
+    t_values = np.full(N, np.inf)
+    normals_out = np.zeros((N, 3))
+    
+    for i in range(N):
+        # denom = direction · normal
+        denom = (ray_directions[i, 0] * normal[0] + 
+                 ray_directions[i, 1] * normal[1] + 
+                 ray_directions[i, 2] * normal[2])
+        
+        if abs(denom) < 1e-10:
+            continue
+        
+        # t = (offset - origin · normal) / denom
+        origin_dot_normal = (ray_origins[i, 0] * normal[0] + 
+                            ray_origins[i, 1] * normal[1] + 
+                            ray_origins[i, 2] * normal[2])
+        t = (offset - origin_dot_normal) / denom
+        
+        if t > 1e-6:
+            t_values[i] = t
+            # Normal points towards ray origin
+            if denom > 0:
+                normals_out[i, 0] = -normal[0]
+                normals_out[i, 1] = -normal[1]
+                normals_out[i, 2] = -normal[2]
+            else:
+                normals_out[i, 0] = normal[0]
+                normals_out[i, 1] = normal[1]
+                normals_out[i, 2] = normal[2]
+    
+    return t_values, normals_out
+
+
+@njit(cache=True)
+def _cube_intersect_batch(ray_origins, ray_directions, min_bound, max_bound):
+    """
+    Vectorized cube intersection using slab method (JIT-compiled).
+    """
+    N = ray_origins.shape[0]
+    t_values = np.full(N, np.inf)
+    normals = np.zeros((N, 3))
+    
+    for i in range(N):
+        t_min = -np.inf
+        t_max = np.inf
+        normal_axis = 0
+        normal_sign = 1.0
+        valid = True
+        
+        for axis in range(3):
+            d = ray_directions[i, axis]
+            o = ray_origins[i, axis]
+            
+            if abs(d) < 1e-10:
+                # Ray parallel to slab
+                if o < min_bound[axis] or o > max_bound[axis]:
+                    valid = False
+                    break
+            else:
+                t1 = (min_bound[axis] - o) / d
+                t2 = (max_bound[axis] - o) / d
+                
+                if t1 > t2:
+                    t1, t2 = t2, t1
+                    sign = 1.0
+                else:
+                    sign = -1.0
+                
+                if t1 > t_min:
+                    t_min = t1
+                    normal_axis = axis
+                    normal_sign = sign
+                
+                t_max = min(t_max, t2)
+                
+                if t_min > t_max:
+                    valid = False
+                    break
+        
+        if not valid:
+            continue
+        
+        if t_min >= 1e-6:
+            t_values[i] = t_min
+            normals[i, normal_axis] = normal_sign
+        elif t_max >= 1e-6:
+            t_values[i] = t_max
+            # Find exit face for inside hits
+            for axis in range(3):
+                d = ray_directions[i, axis]
+                if abs(d) < 1e-10:
+                    continue
+                o = ray_origins[i, axis]
+                t1 = (min_bound[axis] - o) / d
+                t2 = (max_bound[axis] - o) / d
+                if abs(max(t1, t2) - t_max) < 1e-6:
+                    if t2 > t1:
+                        normals[i, axis] = 1.0
+                    else:
+                        normals[i, axis] = -1.0
+                    break
+    
+    return t_values, normals
+
+
+@njit(cache=True)
+def _find_nearest_intersection_jit(ray_origins, ray_directions, 
+                                   sphere_centers, sphere_radii,
+                                   plane_normals, plane_offsets,
+                                   cube_min_bounds, cube_max_bounds,
+                                   surface_types, surface_indices,
+                                   num_spheres, num_planes, num_cubes):
+    """
+    Find nearest intersection for all rays against all surfaces (JIT-accelerated).
+    
+    surface_types: 0=sphere, 1=plane, 2=cube
+    surface_indices: index into respective type array
+    
+    Note: We use regular range instead of prange to avoid thread contention
+    when used with multiprocessing. The parallelization is handled at the 
+    process level by render_parallel.
+    """
+    N = ray_origins.shape[0]
+    num_surfaces = len(surface_types)
+    
+    best_t = np.full(N, np.inf)
+    best_surf_idx = np.full(N, -1, dtype=np.int32)
+    best_normals = np.zeros((N, 3))
+    
+    for ray_idx in range(N):
+        ray_o = ray_origins[ray_idx]
+        ray_d = ray_directions[ray_idx]
+        
+        for surf_idx in range(num_surfaces):
+            surf_type = surface_types[surf_idx]
+            type_idx = surface_indices[surf_idx]
+            
+            t = np.inf
+            nx, ny, nz = 0.0, 0.0, 0.0
+            
+            if surf_type == 0:  # Sphere
+                center = sphere_centers[type_idx]
+                radius = sphere_radii[type_idx]
+                
+                oc_x = ray_o[0] - center[0]
+                oc_y = ray_o[1] - center[1]
+                oc_z = ray_o[2] - center[2]
+                
+                a = ray_d[0]**2 + ray_d[1]**2 + ray_d[2]**2
+                b = 2.0 * (oc_x*ray_d[0] + oc_y*ray_d[1] + oc_z*ray_d[2])
+                c = oc_x**2 + oc_y**2 + oc_z**2 - radius**2
+                
+                disc = b*b - 4*a*c
+                if disc >= 0:
+                    sqrt_disc = np.sqrt(disc)
+                    t1 = (-b - sqrt_disc) / (2*a)
+                    t2 = (-b + sqrt_disc) / (2*a)
+                    
+                    if t1 > 1e-6:
+                        t = t1
+                    elif t2 > 1e-6:
+                        t = t2
+                    
+                    if t < np.inf:
+                        hit_x = ray_o[0] + t * ray_d[0]
+                        hit_y = ray_o[1] + t * ray_d[1]
+                        hit_z = ray_o[2] + t * ray_d[2]
+                        nx = (hit_x - center[0]) / radius
+                        ny = (hit_y - center[1]) / radius
+                        nz = (hit_z - center[2]) / radius
+            
+            elif surf_type == 1:  # Plane
+                normal = plane_normals[type_idx]
+                offset = plane_offsets[type_idx]
+                
+                denom = ray_d[0]*normal[0] + ray_d[1]*normal[1] + ray_d[2]*normal[2]
+                if abs(denom) >= 1e-10:
+                    origin_dot = ray_o[0]*normal[0] + ray_o[1]*normal[1] + ray_o[2]*normal[2]
+                    t_cand = (offset - origin_dot) / denom
+                    if t_cand > 1e-6:
+                        t = t_cand
+                        if denom > 0:
+                            nx, ny, nz = -normal[0], -normal[1], -normal[2]
+                        else:
+                            nx, ny, nz = normal[0], normal[1], normal[2]
+            
+            elif surf_type == 2:  # Cube
+                min_b = cube_min_bounds[type_idx]
+                max_b = cube_max_bounds[type_idx]
+                
+                t_min = -np.inf
+                t_max_local = np.inf
+                n_axis = 0
+                n_sign = 1.0
+                valid = True
+                
+                for axis in range(3):
+                    d = ray_d[axis]
+                    o = ray_o[axis]
+                    
+                    if abs(d) < 1e-10:
+                        if o < min_b[axis] or o > max_b[axis]:
+                            valid = False
+                            break
+                    else:
+                        t1 = (min_b[axis] - o) / d
+                        t2 = (max_b[axis] - o) / d
+                        
+                        if t1 > t2:
+                            t1, t2 = t2, t1
+                            sign = 1.0
+                        else:
+                            sign = -1.0
+                        
+                        if t1 > t_min:
+                            t_min = t1
+                            n_axis = axis
+                            n_sign = sign
+                        
+                        if t2 < t_max_local:
+                            t_max_local = t2
+                        
+                        if t_min > t_max_local:
+                            valid = False
+                            break
+                
+                if valid:
+                    if t_min >= 1e-6:
+                        t = t_min
+                        if n_axis == 0:
+                            nx = n_sign
+                        elif n_axis == 1:
+                            ny = n_sign
+                        else:
+                            nz = n_sign
+                    elif t_max_local >= 1e-6:
+                        t = t_max_local
+            
+            if t < best_t[ray_idx]:
+                best_t[ray_idx] = t
+                best_surf_idx[ray_idx] = surf_idx
+                best_normals[ray_idx, 0] = nx
+                best_normals[ray_idx, 1] = ny
+                best_normals[ray_idx, 2] = nz
+    
+    return best_t, best_surf_idx, best_normals
 
 
 def normalize(v):
@@ -159,6 +483,104 @@ def find_nearest_intersection_batch(ray_origins, ray_directions, surfaces, max_t
     return best_t, best_surface_idx, best_normals
 
 
+def prepare_surface_data(surfaces):
+    """
+    Prepare surface data as numpy arrays for JIT-compiled intersection.
+    
+    Returns a dict containing arrays that can be passed to _find_nearest_intersection_jit.
+    """
+    spheres = [(i, s) for i, s in enumerate(surfaces) if isinstance(s, Sphere)]
+    planes = [(i, s) for i, s in enumerate(surfaces) if isinstance(s, InfinitePlane)]
+    cubes = [(i, s) for i, s in enumerate(surfaces) if isinstance(s, Cube)]
+    
+    num_spheres = len(spheres)
+    num_planes = len(planes)
+    num_cubes = len(cubes)
+    num_surfaces = len(surfaces)
+    
+    # Arrays for spheres
+    sphere_centers = np.zeros((max(1, num_spheres), 3))
+    sphere_radii = np.zeros(max(1, num_spheres))
+    for idx, (_, s) in enumerate(spheres):
+        sphere_centers[idx] = s.position
+        sphere_radii[idx] = s.radius
+    
+    # Arrays for planes
+    plane_normals = np.zeros((max(1, num_planes), 3))
+    plane_offsets = np.zeros(max(1, num_planes))
+    for idx, (_, s) in enumerate(planes):
+        plane_normals[idx] = s.normal
+        plane_offsets[idx] = s.offset
+    
+    # Arrays for cubes
+    cube_min_bounds = np.zeros((max(1, num_cubes), 3))
+    cube_max_bounds = np.zeros((max(1, num_cubes), 3))
+    for idx, (_, s) in enumerate(cubes):
+        cube_min_bounds[idx] = s.min_bound
+        cube_max_bounds[idx] = s.max_bound
+    
+    # Surface type mapping: 0=sphere, 1=plane, 2=cube
+    surface_types = np.zeros(num_surfaces, dtype=np.int32)
+    surface_type_indices = np.zeros(num_surfaces, dtype=np.int32)
+    
+    sphere_idx = 0
+    plane_idx = 0
+    cube_idx = 0
+    for i, s in enumerate(surfaces):
+        if isinstance(s, Sphere):
+            surface_types[i] = 0
+            surface_type_indices[i] = sphere_idx
+            sphere_idx += 1
+        elif isinstance(s, InfinitePlane):
+            surface_types[i] = 1
+            surface_type_indices[i] = plane_idx
+            plane_idx += 1
+        elif isinstance(s, Cube):
+            surface_types[i] = 2
+            surface_type_indices[i] = cube_idx
+            cube_idx += 1
+    
+    # Pre-compute material indices (0-indexed)
+    material_indices = np.array([s.material_index - 1 for s in surfaces], dtype=np.int32)
+    
+    return {
+        'sphere_centers': sphere_centers,
+        'sphere_radii': sphere_radii,
+        'plane_normals': plane_normals,
+        'plane_offsets': plane_offsets,
+        'cube_min_bounds': cube_min_bounds,
+        'cube_max_bounds': cube_max_bounds,
+        'surface_types': surface_types,
+        'surface_indices': surface_type_indices,
+        'material_indices': material_indices,
+        'num_spheres': num_spheres,
+        'num_planes': num_planes,
+        'num_cubes': num_cubes,
+    }
+
+
+def find_nearest_intersection_batch_jit(ray_origins, ray_directions, surface_data, max_t=np.inf):
+    """
+    JIT-accelerated version of find_nearest_intersection_batch.
+    Uses pre-computed surface data arrays.
+    """
+    t_values, surface_indices, normals = _find_nearest_intersection_jit(
+        ray_origins, ray_directions,
+        surface_data['sphere_centers'], surface_data['sphere_radii'],
+        surface_data['plane_normals'], surface_data['plane_offsets'],
+        surface_data['cube_min_bounds'], surface_data['cube_max_bounds'],
+        surface_data['surface_types'], surface_data['surface_indices'],
+        surface_data['num_spheres'], surface_data['num_planes'], surface_data['num_cubes']
+    )
+    
+    # Apply max_t filter
+    if max_t < np.inf:
+        too_far = t_values > max_t
+        surface_indices[too_far] = -1
+    
+    return t_values, surface_indices, normals
+
+
 def compute_soft_shadow(hit_point, light, surfaces, materials, n_shadow_rays):
     """
     Compute soft shadow with transparency (bonus feature).
@@ -218,7 +640,7 @@ def compute_soft_shadow(hit_point, light, surfaces, materials, n_shadow_rays):
     return total_transmission / (n_shadow_rays * n_shadow_rays)
 
 
-def compute_soft_shadow_batch(hit_points, hit_mask, light, surfaces, material_indices, materials_array, n_shadow_rays):
+def compute_soft_shadow_batch(hit_points, hit_mask, light, surface_data, material_indices, materials_array, n_shadow_rays):
     """
     Compute soft shadows for a batch of hit points (vectorized).
     
@@ -226,7 +648,7 @@ def compute_soft_shadow_batch(hit_points, hit_mask, light, surfaces, material_in
         hit_points: (N, 3) array of hit points
         hit_mask: (N,) boolean mask of valid hit points
         light: Light object
-        surfaces: list of surface objects
+        surface_data: pre-computed surface data for JIT intersection
         material_indices: (N,) array of material indices for each hit point
         materials_array: dict with material properties as arrays
         n_shadow_rays: number of shadow rays per dimension
@@ -258,7 +680,7 @@ def compute_soft_shadow_batch(hit_points, hit_mask, light, surfaces, material_in
         
         trans = compute_shadow_transmission_batch(
             shadow_origins, directions, distances - EPSILON, 
-            surfaces, material_indices[active_indices], materials_array
+            surface_data, material_indices[active_indices], materials_array
         )
         transmissions[active_indices] = trans
         return transmissions
@@ -317,7 +739,7 @@ def compute_soft_shadow_batch(hit_points, hit_mask, light, surfaces, material_in
             
             trans = compute_shadow_transmission_batch(
                 shadow_origins, directions, distances - EPSILON,
-                surfaces, material_indices[active_indices], materials_array
+                surface_data, material_indices[active_indices], materials_array
             )
             total_trans += trans
     
@@ -325,7 +747,7 @@ def compute_soft_shadow_batch(hit_points, hit_mask, light, surfaces, material_in
     return transmissions
 
 
-def compute_shadow_transmission_batch(origins, directions, max_distances, surfaces, 
+def compute_shadow_transmission_batch(origins, directions, max_distances, surface_data, 
                                       hit_material_indices, materials_array):
     """
     Compute shadow ray transmission for a batch of rays, accounting for transparency.
@@ -334,7 +756,7 @@ def compute_shadow_transmission_batch(origins, directions, max_distances, surfac
         origins: (M, 3) shadow ray origins
         directions: (M, 3) shadow ray directions
         max_distances: (M,) max distance to light
-        surfaces: list of surface objects
+        surface_data: pre-computed surface data for JIT intersection
         hit_material_indices: (M,) material indices of the primary hit surfaces
         materials_array: dict with transparency array
     
@@ -354,13 +776,12 @@ def compute_shadow_transmission_batch(origins, directions, max_distances, surfac
         if not np.any(active):
             break
         
-        # Find intersections for active rays
+        # Find intersections for active rays (using JIT version)
         active_indices = np.where(active)[0]
-        t_vals, surf_idx, _ = find_nearest_intersection_batch(
+        t_vals, surf_idx, _ = find_nearest_intersection_batch_jit(
             current_origins[active_indices],
             directions[active_indices],
-            surfaces,
-            max_t=np.inf
+            surface_data
         )
         
         # Check which rays hit something before the light
@@ -373,8 +794,8 @@ def compute_shadow_transmission_batch(origins, directions, max_distances, surfac
         hit_idx = active_indices[hit_before_light]
         blocking_surf_idx = surf_idx[hit_before_light]
         
-        # Get material index for each blocking surface
-        blocking_mat_idx = np.array([surfaces[si].material_index - 1 for si in blocking_surf_idx])
+        # Get material index for each blocking surface (using pre-computed array)
+        blocking_mat_idx = surface_data['material_indices'][blocking_surf_idx]
         
         # Multiply transmission by transparency
         transparencies = materials_array['transparency'][blocking_mat_idx]
@@ -625,6 +1046,10 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
         'transparency': np.array([m.transparency for m in materials]),   # (num_mat,)
     }
     
+    # Prepare surface data for JIT-accelerated intersection (one-time cost)
+    surface_data = prepare_surface_data(surfaces)
+    print(f"Prepared surface data for JIT: {len(surfaces)} surfaces")
+    
     # Generate all primary rays at once
     ray_gen_start = time.time()
     ray_origins, ray_directions = camera.generate_all_rays(width, height)
@@ -651,12 +1076,12 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
         active_count = np.sum(active)
         print(f"Depth {depth}: Processing {active_count} active rays...")
         
-        # Find intersections for all active rays
+        # Find intersections for all active rays (using JIT-accelerated version)
         active_idx = np.where(active)[0]
-        t_values, surface_indices, normals = find_nearest_intersection_batch(
+        t_values, surface_indices, normals = find_nearest_intersection_batch_jit(
             current_origins[active_idx],
             current_directions[active_idx],
-            surfaces
+            surface_data
         )
         
         # Separate hits from misses
@@ -681,8 +1106,8 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
         # Compute hit points
         hit_points = hit_origins + hit_t[:, np.newaxis] * hit_directions
         
-        # Get material indices for hit surfaces (1-indexed to 0-indexed)
-        hit_mat_idx = np.array([surfaces[si].material_index - 1 for si in hit_surf_idx])
+        # Get material indices for hit surfaces (using pre-computed array)
+        hit_mat_idx = surface_data['material_indices'][hit_surf_idx]
         
         # View directions (from hit point to camera)
         view_dirs = normalize_batch(hit_origins - hit_points)
@@ -701,7 +1126,7 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
             light_dists = np.linalg.norm(to_light, axis=1)
             light_dirs = to_light / light_dists[:, np.newaxis]
             
-            # Compute soft shadows (vectorized)
+            # Compute soft shadows (vectorized, JIT-accelerated)
             shadow_hit_mask = np.ones(M, dtype=bool)  # All hits are valid
             
             # Create temporary full-size arrays for shadow computation
@@ -713,7 +1138,7 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
             shadow_trans = compute_soft_shadow_batch(
                 hit_points + hit_normals * EPSILON,
                 shadow_hit_mask,
-                light, surfaces, temp_mat_idx, materials_array, n_shadow
+                light, surface_data, temp_mat_idx, materials_array, n_shadow
             )
             
             # Light intensity with shadow
@@ -838,6 +1263,7 @@ def _render_row_chunk(args):
     background_color = np.array(scene_data['background_color'])
     materials_array = scene_data['materials_array']
     surfaces = scene_data['surfaces']
+    surface_data = scene_data['surface_data']  # JIT-accelerated intersection data
     lights = scene_data['lights']
     
     # Generate rays for this chunk
@@ -858,10 +1284,10 @@ def _render_row_chunk(args):
             break
         
         active_idx = np.where(active)[0]
-        t_values, surface_indices, normals = find_nearest_intersection_batch(
+        t_values, surface_indices, normals = find_nearest_intersection_batch_jit(
             current_origins[active_idx],
             current_directions[active_idx],
-            surfaces
+            surface_data
         )
         
         hit_mask_local = surface_indices >= 0
@@ -881,7 +1307,7 @@ def _render_row_chunk(args):
         hit_directions = current_directions[hit_idx]
         
         hit_points = hit_origins + hit_t[:, np.newaxis] * hit_directions
-        hit_mat_idx = np.array([surfaces[si].material_index - 1 for si in hit_surf_idx])
+        hit_mat_idx = surface_data['material_indices'][hit_surf_idx]  # Using pre-computed array
         view_dirs = normalize_batch(hit_origins - hit_points)
         
         M = len(hit_idx)
@@ -903,7 +1329,7 @@ def _render_row_chunk(args):
             shadow_trans = compute_soft_shadow_batch(
                 hit_points + hit_normals * EPSILON,
                 shadow_hit_mask,
-                light, surfaces, temp_mat_idx, materials_array, n_shadow
+                light, surface_data, temp_mat_idx, materials_array, n_shadow
             )
             
             light_intensity = ((1 - light.shadow_intensity) + 
@@ -1012,6 +1438,10 @@ def render_parallel(camera, scene_settings, materials, surfaces, lights, width, 
         'transparency': np.array([m.transparency for m in materials]),
     }
     
+    # Prepare surface data for JIT-accelerated intersection (done once, shared by workers)
+    surface_data = prepare_surface_data(surfaces)
+    print(f"Prepared surface data for JIT: {len(surfaces)} surfaces")
+    
     # Scene data for workers
     scene_data = {
         'width': width,
@@ -1020,7 +1450,8 @@ def render_parallel(camera, scene_settings, materials, surfaces, lights, width, 
         'n_shadow': n_shadow,
         'background_color': background_color.tolist(),
         'materials_array': materials_array,
-        'surfaces': surfaces,
+        'surfaces': surfaces,  # Keep for compatibility
+        'surface_data': surface_data,  # JIT-accelerated intersection data
         'lights': lights,
     }
     

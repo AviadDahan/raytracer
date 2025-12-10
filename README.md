@@ -308,6 +308,9 @@ Tested on 500x500 image with pool.txt scene (10 CPU cores):
 | Sequential | ~600s | 1x (baseline) |
 | Vectorized | 14.7s | ~40x |
 | Parallel (10 workers) | 3.2s | ~200x |
+| **Parallel + JIT (10 workers)** | **1.4s** | **~430x** |
+
+*With Numba JIT compilation enabled (v2.1.0), the parallel renderer achieves an additional 2.3x speedup.*
 
 #### Technical Changes
 
@@ -342,6 +345,19 @@ Tested on 500x500 image with pool.txt scene (10 CPU cores):
 - Row-based chunking with ~4 chunks per worker for load balancing
 - Parallel is now the default renderer
 - CLI flags: `--vectorized` (single-threaded), `--workers N` (set worker count)
+
+##### Numba JIT Compilation (v2.1.0)
+
+**`ray_tracer.py`**
+- Added `@njit` compiled intersection functions for sphere, plane, and cube
+- Added `_find_nearest_intersection_jit()` - JIT-compiled unified intersection testing against all surfaces
+- Added `prepare_surface_data()` - extracts surface geometry into contiguous NumPy arrays for JIT access
+- Added `find_nearest_intersection_batch_jit()` - wrapper for JIT-accelerated batch intersection
+- Pre-computed material indices as arrays for fast lookup (avoiding Python list comprehensions)
+- All intersection hot paths now use Numba-compiled code for ~2-4x additional speedup
+
+**`requirements.txt`**
+- Added `numba` dependency for JIT compilation
 
 #### Bug Fixes
 
