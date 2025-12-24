@@ -2,6 +2,11 @@
 
 A Python-based ray tracer implementing the Phong shading model with support for multiple surface types, soft shadows, reflections, and transparency.
 
+## Documentation
+
+- **Getting started / CLI / scene format**: `docs/USAGE.md`
+- **Full API reference (all public functions/classes)**: `docs/API.md`
+
 ## Features
 
 - **Surface Types**: Spheres, Infinite Planes, and Axis-Aligned Cubes
@@ -234,6 +239,13 @@ lgt   px py pz   r g b   spec   shadow   width
 ```
 
 Lines starting with `#` are comments. Material indices are 1-based in order of definition.
+
+## More
+
+For more complete and example-driven documentation:
+
+- `docs/USAGE.md` (installation, CLI, and scene format)
+- `docs/API.md` (module/class/function reference + programmatic examples)
 
 ## Implementation Details
 
