@@ -1,364 +1,298 @@
 # Ray Tracer
 
-A Python-based ray tracer implementing the Phong shading model with support for multiple surface types, soft shadows, reflections, and transparency.
+A high-performance Python ray tracer implementing Phong shading with soft shadows, reflections, and transparency. Achieves **~200x speedup** over naive implementations through NumPy vectorization and multiprocessing parallelization.
+
+## Quick Start
+
+```bash
+# Install dependencies
+pip install -r requirements.txt
+
+# Render a scene (uses all CPU cores by default)
+python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500
+```
 
 ## Features
 
-- **Surface Types**: Spheres, Infinite Planes, and Axis-Aligned Cubes
-- **Phong Shading**: Diffuse and specular lighting with configurable shininess
-- **Soft Shadows**: N×N grid sampling with random jittering for smooth shadow edges
-- **Transparency**: Semi-transparent materials with recursive ray continuation
-- **Reflections**: Recursive reflection rays with configurable reflection color
-- **Transparency in Shadows (Bonus)**: Light passes through transparent objects proportionally
+- **Surfaces**: Spheres, infinite planes, axis-aligned cubes
+- **Phong Shading**: Diffuse and specular lighting
+- **Soft Shadows**: N×N jittered grid sampling for smooth shadow edges
+- **Reflections**: Recursive reflection rays with configurable tint
+- **Transparency**: Light passes through transparent objects proportionally
 
-## Changes from Skeleton Code
+---
 
-The original skeleton provided basic data classes with no ray tracing logic. Below is a summary of all additions and modifications:
+## How It Works: Parallel Vectorized Rendering
 
-### New Files
+The renderer combines two optimization strategies to achieve massive speedups:
 
-| File | Description |
-|------|-------------|
-| `requirements.txt` | Dependencies (numpy, pillow) |
-| `README.md` | Project documentation |
+### The Problem with Traditional Ray Tracing
 
-### Modified Files
+A naive ray tracer processes one pixel at a time:
 
-#### `ray_tracer.py`
-The skeleton only had `parse_scene_file()` and a placeholder `main()`. Added:
-- `normalize(v)`, `reflect(d, n)` - Vector utility functions
-- `separate_objects(objects)` - Separates parsed objects by type
-- `find_nearest_intersection()` - Ray-surface intersection testing
-- `compute_soft_shadow()` - N×N grid shadow sampling with jittering
-- `compute_shadow_ray_transmission()` - Transparency-aware shadow rays (bonus)
-- `compute_color()` - Full Phong shading implementation
-- `trace_ray()` - Recursive ray tracing with reflection/transparency
-- `render()` - Main render loop with progress reporting
-- `save_image()` - Fixed to use output path argument (was hardcoded)
+```
+for each pixel (x, y):
+    generate ray
+    trace ray through scene
+    compute color
+```
 
-#### `camera.py`
-The skeleton only stored constructor parameters. Added:
-- Converted all vectors to `np.array` for efficient math
-- `setup(aspect_ratio)` - Computes orthonormal camera basis (forward, right, up)
-- `generate_ray(x, y, width, height)` - Generates ray through pixel coordinates
+For a 500×500 image, this means 250,000 sequential operations—each involving multiple intersection tests, shadow rays, and recursive reflections. This is painfully slow in Python due to interpreter overhead.
 
-#### `surfaces/sphere.py`
-The skeleton only stored position, radius, material_index. Added:
-- Converted position to `np.array`
-- `intersect(ray_origin, ray_direction)` - Quadratic formula intersection, returns (t, normal)
+### Solution: Vectorization + Parallelization
 
-#### `surfaces/infinite_plane.py`
-The skeleton only stored normal, offset, material_index. Added:
-- Converted normal to `np.array` and normalized it
-- `intersect(ray_origin, ray_direction)` - Plane intersection formula, returns (t, normal)
+#### 1. NumPy Vectorization
 
-#### `surfaces/cube.py`
-The skeleton only stored position, scale, material_index. Added:
-- Converted position to `np.array`
-- Pre-computed `min_bound` and `max_bound` for efficiency
-- `intersect(ray_origin, ray_direction)` - Slab method intersection, returns (t, normal)
+Instead of processing rays one-by-one, we process them **in batches** using NumPy arrays. This eliminates Python loop overhead and leverages optimized C/Fortran routines.
 
-#### `light.py`
-- Converted position and color to `np.array`
+**Example: Ray-Sphere Intersection**
 
-#### `material.py`
-- Converted diffuse_color, specular_color, reflection_color to `np.array`
+```python
+# Sequential (slow): One ray at a time
+def intersect(ray_origin, ray_direction):
+    oc = ray_origin - self.position
+    a = dot(ray_direction, ray_direction)
+    b = 2 * dot(oc, ray_direction)
+    c = dot(oc, oc) - radius²
+    # ... solve quadratic for single ray
 
-#### `scene_settings.py`
-- Converted background_color to `np.array`
-- Cast shadow rays and max recursions to `int`
+# Vectorized (fast): All rays at once
+def intersect_batch(ray_origins, ray_directions):  # (N, 3) arrays
+    oc = ray_origins - self.position              # (N, 3)
+    a = np.sum(ray_directions * ray_directions, axis=1)  # (N,)
+    b = 2 * np.sum(oc * ray_directions, axis=1)          # (N,)
+    c = np.sum(oc * oc, axis=1) - radius²                # (N,)
+    # ... solve N quadratics in parallel
+```
 
-### Skeleton Code Preserved
+The vectorized version processes 250,000 rays in a single NumPy operation.
 
-- Scene file parsing logic in `parse_scene_file()` (unchanged)
-- Command-line argument parsing structure (unchanged)
-- Class attribute names and constructor signatures (unchanged)
+#### 2. Iterative Depth Traversal
 
-## Usage
+Traditional ray tracing uses recursion for reflections:
+
+```python
+def trace_ray(origin, direction, depth):
+    hit = find_intersection(origin, direction)
+    color = compute_lighting(hit)
+    if has_reflection:
+        color += trace_ray(reflect_origin, reflect_dir, depth - 1)  # recursive
+    return color
+```
+
+Recursion doesn't vectorize. Instead, we use **iterative depth traversal**:
+
+```
+Depth 0: Trace ALL 250,000 primary rays at once
+         → Find intersections (vectorized)
+         → Compute shading (vectorized)
+         → Identify rays that need reflection
+         
+Depth 1: Trace ~95,000 reflection rays at once
+         → Repeat shading
+         → Identify next level reflections
+         
+Depth 2: Trace ~20,000 rays
+         → Continue until max_depth or no active rays
+```
+
+Each depth level is a single batch operation.
+
+#### 3. Multiprocessing Parallelization
+
+Vectorization speeds up single-threaded execution ~40x. To use multiple CPU cores, we add multiprocessing:
+
+```
+Image rows divided into chunks:
+┌─────────────────────────────┐
+│  Chunk 1 (rows 0-30)        │ → Worker 1
+├─────────────────────────────┤
+│  Chunk 2 (rows 31-60)       │ → Worker 2
+├─────────────────────────────┤
+│  Chunk 3 (rows 61-90)       │ → Worker 3
+├─────────────────────────────┤
+│  ...                        │ → ...
+└─────────────────────────────┘
+
+Each worker runs the full vectorized pipeline on its chunk independently.
+Final image assembled by combining all chunks.
+```
+
+The chunks are made small (~4 per worker) for load balancing—some image regions have more reflections/shadows and take longer.
+
+### Soft Shadow Computation
+
+Soft shadows require N×N rays per hit point per light. This is handled in batches:
+
+```python
+def compute_soft_shadow_batch(hit_points, light, ...):
+    M = len(hit_points)  # e.g., 50,000 hit points
+    
+    # Compute light plane basis for each point
+    to_light = light_pos - hit_points  # (M, 3)
+    light_dirs = normalize(to_light)   # (M, 3)
+    right = cross(light_dirs, up_ref)  # (M, 3) per-point basis
+    up = cross(right, light_dirs)      # (M, 3)
+    
+    # Sample NxN grid (e.g., 5×5 = 25 shadow rays per point)
+    for i in range(N):
+        for j in range(N):
+            # Random offset within cell (vectorized for all M points)
+            rand_i, rand_j = np.random.random(M), np.random.random(M)
+            
+            # Compute shadow ray directions for all M points at once
+            sample_pos = light_pos + offset_i * right + offset_j * up
+            directions = normalize(sample_pos - hit_points)
+            
+            # Trace all M shadow rays simultaneously
+            transmission = trace_shadow_batch(hit_points, directions, ...)
+            total_trans += transmission
+    
+    return total_trans / (N * N)
+```
+
+For 50,000 hit points with 5×5 shadow sampling and 2 lights, this means **2.5 million shadow rays**—all computed as batch operations.
+
+---
+
+## Architecture Overview
+
+```
+┌────────────────────────────────────────────────────────────────────┐
+│                        render_parallel()                           │
+│  • Divides image into row chunks                                   │
+│  • Spawns worker processes via multiprocessing.Pool                │
+│  • Each worker calls _render_row_chunk()                           │
+└─────────────────────────────┬──────────────────────────────────────┘
+                              │
+                              ▼
+┌────────────────────────────────────────────────────────────────────┐
+│                      _render_row_chunk()                           │
+│  • Generates rays for assigned rows (camera.generate_rays_for_rows)│
+│  • Runs iterative depth traversal loop                             │
+└─────────────────────────────┬──────────────────────────────────────┘
+                              │
+         ┌────────────────────┼────────────────────┐
+         │                    │                    │
+         ▼                    ▼                    ▼
+┌─────────────────┐  ┌─────────────────┐  ┌─────────────────┐
+│ find_nearest_   │  │ compute_soft_   │  │ reflect_batch() │
+│ intersection_   │  │ shadow_batch()  │  │ normalize_batch │
+│ batch()         │  │                 │  │                 │
+├─────────────────┤  ├─────────────────┤  └─────────────────┘
+│ Calls each      │  │ N×N shadow grid │
+│ surface's       │  │ with per-point  │
+│ intersect_batch │  │ light basis     │
+└─────────────────┘  └─────────────────┘
+         │
+         ▼
+┌─────────────────────────────────────────┐
+│ Surface.intersect_batch() methods       │
+│ • Sphere: batch quadratic formula       │
+│ • Plane: batch ray-plane intersection   │
+│ • Cube: batch slab method               │
+└─────────────────────────────────────────┘
+```
+
+---
+
+## Performance
+
+Benchmarks on 500×500 image with `pool.txt` scene (10 CPU cores):
+
+| Renderer | Time | Speedup |
+|----------|------|---------|
+| Sequential | ~600s | 1× (baseline) |
+| Vectorized | 14.7s | ~40× |
+| Parallel (10 workers) | 3.2s | ~200× |
+
+---
+
+## Command Line Options
 
 ```bash
 python ray_tracer.py <scene_file> <output_image> [options]
 ```
 
-### Options
-
 | Option | Description |
 |--------|-------------|
 | `--width WIDTH` | Image width in pixels (default: 500) |
 | `--height HEIGHT` | Image height in pixels (default: 500) |
-| `--workers N` | Number of worker processes (default: CPU count) |
-| `--vectorized` | Use single-threaded vectorized renderer |
-| `--sequential` | Use original sequential renderer |
+| `--workers N` | Number of worker processes (default: all CPUs) |
+| `--vectorized` | Single-threaded vectorized renderer |
+| `--sequential` | Original pixel-by-pixel renderer |
 
 ### Examples
 
 ```bash
-# Default: parallel rendering with all CPU cores (fastest)
-python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500
+# Default: parallel rendering (fastest)
+python ray_tracer.py scenes/pool.txt output/pool.png
 
-# Parallel with specific worker count
+# Use 4 workers
 python ray_tracer.py scenes/pool.txt output/pool.png --workers 4
 
-# Single-threaded vectorized rendering
+# Single-threaded vectorized
 python ray_tracer.py scenes/pool.txt output/pool.png --vectorized
+
+# Original sequential (for comparison)
+python ray_tracer.py scenes/pool.txt output/pool.png --sequential
 ```
+
+---
 
 ## Project Structure
 
 ```
 raytracer/
-├── ray_tracer.py          # Main entry point and core ray tracing logic
-├── camera.py              # Camera class with ray generation
-├── light.py               # Point light source definition
-├── material.py            # Material properties (colors, shininess, transparency)
-├── scene_settings.py      # Global scene settings
+├── ray_tracer.py          # Main entry: render loops, shading, shadows
+├── camera.py              # Ray generation (single + batch)
+├── light.py               # Point light definition
+├── material.py            # Material properties
+├── scene_settings.py      # Background, shadow rays, max depth
 ├── surfaces/
-│   ├── __init__.py
-│   ├── sphere.py          # Sphere surface with ray intersection
-│   ├── infinite_plane.py  # Infinite plane surface
-│   └── cube.py            # Axis-aligned cube (box) surface
+│   ├── sphere.py          # Sphere intersection (single + batch)
+│   ├── infinite_plane.py  # Plane intersection (single + batch)
+│   └── cube.py            # Cube intersection (single + batch)
 ├── scenes/
-│   └── pool.txt           # Example scene file
-└── output/
-    └── *.png              # Rendered images
+│   └── pool.txt           # Example scene
+└── output/                # Rendered images
 ```
 
-## Component Documentation
-
-### `ray_tracer.py` - Main Ray Tracer
-
-The core module containing:
-
-- **`parse_scene_file(file_path)`**: Parses scene definition files and creates scene objects
-- **`separate_objects(objects)`**: Separates parsed objects into materials, surfaces, and lights
-- **`find_nearest_intersection(ray_origin, ray_direction, surfaces, max_t)`**: Tests ray against all surfaces, returns nearest hit
-- **`compute_soft_shadow(hit_point, light, surfaces, materials, n_shadow_rays)`**: Computes soft shadow with transparency support
-- **`compute_shadow_ray_transmission(origin, light_pos, max_distance, surfaces, materials)`**: Traces shadow ray accounting for transparent blockers
-- **`compute_color(...)`**: Applies Phong shading model at a hit point
-- **`trace_ray(...)`**: Recursively traces a ray through the scene
-- **`render(...)`**: Main render loop iterating over all pixels
-- **`save_image(image_array, output_path)`**: Saves rendered image with color clamping
-
-**Color Formula** (per assignment specification):
-```
-output_color = background_color × transparency
-             + (diffuse + specular) × (1 - transparency)
-             + reflection_color
-```
-
-### `camera.py` - Camera
-
-Defines the virtual camera with:
-
-- **Position**: Camera location in 3D space
-- **Look-at Point**: Where the camera is aimed
-- **Up Vector**: Camera orientation (automatically orthogonalized)
-- **Screen Distance**: Focal length controlling viewing angle
-- **Screen Width**: Width of the virtual screen
-
-**Methods**:
-- **`setup(aspect_ratio)`**: Computes orthonormal basis (forward, right, up vectors)
-- **`generate_ray(x, y, width, height)`**: Creates a ray through pixel (x, y)
-
-### `light.py` - Point Light
-
-Defines a point light source with:
-
-- **Position**: Location of the light
-- **Color**: RGB light color
-- **Specular Intensity**: Multiplier for specular highlights
-- **Shadow Intensity**: Controls shadow darkness (0 = no shadow, 1 = full shadow)
-- **Radius**: Size of light area for soft shadows
-
-### `material.py` - Material
-
-Defines surface material properties:
-
-- **Diffuse Color**: Base surface color
-- **Specular Color**: Color of specular highlights
-- **Reflection Color**: Tint applied to reflections
-- **Shininess**: Phong exponent controlling highlight sharpness
-- **Transparency**: 0 = opaque, 1 = fully transparent
-
-### `scene_settings.py` - Scene Settings
-
-Global scene configuration:
-
-- **Background Color**: Color when rays miss all surfaces
-- **Root Number Shadow Rays**: N for N×N shadow sampling grid
-- **Max Recursions**: Depth limit for reflection/transparency rays
-
-### `surfaces/sphere.py` - Sphere
-
-Sphere defined by center position and radius.
-
-**Intersection**: Uses quadratic formula to solve ray-sphere intersection.
-
-### `surfaces/infinite_plane.py` - Infinite Plane
-
-Plane defined by normal vector and offset (P·N = offset).
-
-**Intersection**: Direct formula `t = (offset - origin·normal) / (direction·normal)`
-
-### `surfaces/cube.py` - Axis-Aligned Cube
-
-Cube defined by center position and edge length.
-
-**Intersection**: Uses the slab method - tests ray against 6 axis-aligned planes (2 per axis) and determines if entry point is valid.
+---
 
 ## Scene File Format
 
-Scene files use a simple text format with one object per line:
-
 ```
-# Camera: position, look-at, up vector, screen distance, screen width
-cam   px py pz   lx ly lz   ux uy uz   sc_dist sc_width
+# Camera: position, look-at, up, screen_distance, screen_width
+cam   0 1 -3   0 0 0   0 1 0   2 2
 
-# Settings: background color, shadow rays, max recursion
-set   bgr bgg bgb   sh_rays   rec_max
+# Settings: background_color, shadow_rays_root, max_recursion
+set   0.5 0.7 1.0   5   3
 
-# Material: diffuse, specular, reflection colors, phong coefficient, transparency
-mtl   dr dg db   sr sg sb   rr rg rb   phong   trans
+# Material: diffuse, specular, reflection, shininess, transparency
+mtl   0.8 0.2 0.2   1 1 1   0.3 0.3 0.3   50   0
 
-# Sphere: center, radius, material index
-sph   cx cy cz   radius   mat_idx
+# Sphere: center, radius, material_index
+sph   0 0 0   0.5   1
 
-# Plane: normal, offset, material index
-pln   nx ny nz   offset   mat_idx
+# Plane: normal, offset, material_index
+pln   0 1 0   -0.5   2
 
-# Box: center, edge length, material index
-box   cx cy cz   scale   mat_idx
+# Box: center, edge_length, material_index
+box   1 0 0   0.5   3
 
-# Light: position, color, specular intensity, shadow intensity, radius
-lgt   px py pz   r g b   spec   shadow   width
+# Light: position, color, specular_intensity, shadow_intensity, radius
+lgt   2 3 -2   1 1 1   1   0.8   0.5
 ```
 
-Lines starting with `#` are comments. Material indices are 1-based in order of definition.
-
-## Implementation Details
-
-### Soft Shadows with Transparency (Bonus)
-
-When computing shadows, the ray tracer:
-
-1. Creates an N×N grid on a plane perpendicular to the light direction
-2. Samples a random point within each grid cell
-3. For each shadow ray:
-   - Finds ALL intersecting objects between the point and light
-   - Multiplies transmission by each blocker's transparency value
-4. Averages transmission across all N² rays
-5. Applies: `light_intensity = (1 - shadow_intensity) + shadow_intensity × avg_transmission`
-
-### Performance Optimizations
-
-- All vectors stored as NumPy arrays with `float64` dtype
-- Camera basis vectors computed once during setup
-- Early exit in intersection tests when `t < 0` or `t > max_dist`
-- Pre-allocated image array to avoid repeated allocations
-- Materials accessed by index from pre-built list
+---
 
 ## Dependencies
 
 - Python 3.x
 - NumPy
-- Pillow (PIL)
-
-## Example Output
-
-The `pool.txt` scene renders 6 colored spheres on a plane with multiple light sources creating soft shadows.
-
----
-
-## Changelog
-
-### v2.0.0 - Performance Optimization Release
-
-This release introduces major performance improvements through NumPy vectorization and multiprocessing parallelization, achieving approximately **200x speedup** over the original sequential implementation.
-
-#### New Rendering Modes
-
-| Mode | Flag | Description |
-|------|------|-------------|
-| Parallel | *(default)* | Multiprocessing + vectorization (~200x faster) |
-| Vectorized | `--vectorized` | NumPy batch processing, single-threaded (~40x faster) |
-| Sequential | `--sequential` | Original pixel-by-pixel renderer (baseline) |
-
-#### Usage Examples
+- Pillow
 
 ```bash
-# Parallel rendering (default, fastest, uses all CPU cores)
-python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500
-
-# Parallel with specific worker count
-python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500 --workers 8
-
-# Single-threaded vectorized rendering
-python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500 --vectorized
-
-# Original sequential rendering (for comparison)
-python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500 --sequential
+pip install -r requirements.txt
 ```
-
-#### Performance Benchmarks
-
-Tested on 500x500 image with pool.txt scene (10 CPU cores):
-
-| Renderer | Time | Speedup |
-|----------|------|---------|
-| Sequential | ~600s | 1x (baseline) |
-| Vectorized | 14.7s | ~40x |
-| Parallel (10 workers) | 3.2s | ~200x |
-
-#### Technical Changes
-
-##### NumPy Vectorization
-
-**`camera.py`**
-- Added `generate_all_rays(width, height)` - generates all rays as `(H*W, 3)` arrays using `np.meshgrid`
-- Added `generate_rays_for_rows(width, height, y_start, y_end)` - generates rays for specific row ranges (for parallel rendering)
-
-**`surfaces/sphere.py`**
-- Added `intersect_batch(ray_origins, ray_directions)` - vectorized ray-sphere intersection using batch quadratic formula
-
-**`surfaces/infinite_plane.py`**
-- Added `intersect_batch(ray_origins, ray_directions)` - vectorized ray-plane intersection
-
-**`surfaces/cube.py`**
-- Added `intersect_batch(ray_origins, ray_directions)` - vectorized slab method for ray-box intersection
-
-**`ray_tracer.py`**
-- Added `normalize_batch(v)` - batch vector normalization
-- Added `reflect_batch(d, n)` - batch reflection computation
-- Added `find_nearest_intersection_batch()` - tests all rays against all surfaces in parallel
-- Added `compute_soft_shadow_batch()` - vectorized soft shadow computation with per-point light basis
-- Added `compute_shadow_transmission_batch()` - vectorized shadow ray transmission
-- Added `render_vectorized()` - main vectorized render loop using iterative depth traversal
-
-##### Multiprocessing Parallelization
-
-**`ray_tracer.py`**
-- Added `_render_row_chunk(args)` - worker function that renders a chunk of rows
-- Added `render_parallel(camera, scene_settings, materials, surfaces, lights, width, height, num_workers)` - distributes work across CPU cores using `multiprocessing.Pool`
-- Row-based chunking with ~4 chunks per worker for load balancing
-- Parallel is now the default renderer
-- CLI flags: `--vectorized` (single-threaded), `--workers N` (set worker count)
-
-#### Bug Fixes
-
-- Fixed soft shadow light basis computation in vectorized renderer: now correctly computes per-point basis vectors instead of approximating from first point only
-
-#### Architecture
-
-The vectorized renderer transforms the traditional recursive ray tracing into an iterative batch process:
-
-```
-Depth 0: Trace all primary rays (250,000 for 500x500)
-    └─> Find intersections, compute shading, identify reflection rays
-Depth 1: Trace reflection rays (~95,000 active)
-    └─> Repeat shading, identify next level reflections
-Depth 2: Continue with remaining active rays (~20,000)
-    └─> ... continues until max_depth or no active rays
-```
-
-The parallel renderer divides the image into row chunks, with each worker running the full vectorized pipeline on its assigned rows independently.
-
