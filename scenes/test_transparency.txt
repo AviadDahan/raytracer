@@ -1,0 +1,25 @@
+# Test: Transparency
+# Expected: The front sphere looks "see-through" and you can see the back sphere through it.
+# Note: This ray tracer uses simple transparency (no refraction/bending), so the background/object
+#       behind should appear straight through, like a ghosted overlay.
+
+cam 		0 	3 	-10 	0 	0 	-2 	0 	1 	0 	1.6 	2
+set 		1 	1 	1 	4 	8
+
+# Materials: 	dr 	dg 	db	sr 	sg 	sb	rr 	rg 	rb	phong	trans
+# 1: transparent blue-ish (high trans)
+mtl		0.15	0.35	0.9	0.25	0.35	0.9	0.0	0.0	0.0	50	0.75
+# 2: solid red
+mtl		0.9	0.1	0.1	1	1	1	0.05	0.05	0.05	40	0
+# 3: plane (dark)
+mtl		0.15	0.15	0.15	0.2	0.2	0.2	0.0	0.0	0.0	20	0
+
+pln		0	1	0	-1	3
+
+# Front transparent sphere (closest to camera, but not too close)
+sph		0	0	-7	1	1
+# Back solid sphere (should be visible through the front sphere)
+sph		0	0	-5.5	1	2
+
+# One white light above/right
+lgt		3	6	-2	1	1	1	1	1	0.5

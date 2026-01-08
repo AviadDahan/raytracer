@@ -1,0 +1,23 @@
+# Test: Cube (box) intersection and normals
+# Expected: A visible cube sitting on the plane.
+#           You should see different brightness on different faces (normals change per face).
+
+cam 		0 	5 	-10 	0 	0 	0 	0 	1 	0 	1.8 	2
+set 		1 	1 	1 	3 	5
+
+# 1: gray cube
+mtl		0.7	0.7	0.7	0.7	0.7	0.7	0.05	0.05	0.05	40	0
+# 2: green plane
+mtl		0.3	0.8	0.0	0.0	0.0	0.0	0.0	0.0	0.0	1	0
+# 3: red sphere
+mtl		0.9	0.1	0.1	1	1	1	0.1	0.1	0.1	30	0
+
+pln		0	1	0	-1	2
+
+# box: center at (0,0,-2), scale 2 -> should be about sphere-sized-ish
+box		0	0	-2	2	1
+
+sph		2.5	0	-3	1	3
+
+# Light from the left so cube faces differ
+lgt		-5	6	-5	1	1	1	1	1	0.5

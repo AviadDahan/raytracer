@@ -51,32 +51,6 @@ def intersect_batch(ray_origins, ray_directions):
     ...
 ```
 
-**2. Iterative Depth Traversal**
-
-Recursion doesn't vectorize. Instead, process all rays at each depth level:
-
-```
-Depth 0: Trace 250,000 primary rays
-         -> Find intersections, compute shading, identify reflections
-
-Depth 1: Trace ~95,000 reflection rays
-         -> Repeat
-
-Depth 2: Trace ~20,000 rays
-         -> Continue until max_depth or no active rays
-```
-
-**3. Multiprocessing**
-
-Split image into row chunks, each worker runs the vectorized pipeline independently:
-
-```
-Chunk 1 (rows 0-30)   -> Worker 1
-Chunk 2 (rows 31-60)  -> Worker 2
-Chunk 3 (rows 61-90)  -> Worker 3
-...
-```
-
 ---
 
 ## Performance
@@ -87,8 +61,6 @@ Chunk 3 (rows 61-90)  -> Worker 3
 |----------|------|---------|
 | Sequential | ~600s | 1x |
 | Vectorized | 14.7s | ~40x |
-| Parallel | 3.2s | ~200x |
-
 ---
 
 ## Usage
@@ -101,8 +73,7 @@ python ray_tracer.py <scene_file> <output_image> [options]
 |--------|-------------|
 | `--width N` | Image width (default: 500) |
 | `--height N` | Image height (default: 500) |
-| `--workers N` | Worker processes (default: all CPUs) |
-| `--vectorized` | Single-threaded vectorized |
+| `--vectorized` | Single-threaded vectorized (default)|
 | `--sequential` | Original pixel-by-pixel |
 
 ---
@@ -122,6 +93,7 @@ raytracer/
     cube.py           # Cube intersection (slab method)
   scenes/
     pool.txt          # Example scene
+    ours.txt          # our scene
   output/             # Rendered images
 ```
 
