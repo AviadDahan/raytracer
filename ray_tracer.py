@@ -435,7 +435,7 @@ def render(camera, scene_settings, materials, surfaces, lights, width, height):
 
 
 def render_vectorized(camera, scene_settings, materials, surfaces, lights, width, height):
-    """Render the scene using vectorized operations."""
+    """Render the scene using vectorized operations with stack-based recursion."""
     import time
     
     start_time = time.time()
@@ -464,52 +464,70 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
     N = ray_origins.shape[0]
     print(f"Generated {N} rays in {time.time() - ray_gen_start:.3f}s")
     
-    colors = np.zeros((N, 3))
-    weights = np.ones((N, 3))
+    # Final accumulated colors for each pixel
+    final_colors = np.zeros((N, 3))
     
-    current_origins = ray_origins.copy()
-    current_directions = ray_directions.copy()
-    active = np.ones(N, dtype=bool)
+    # Stack of ray batches to process: (origins, directions, weights, pixel_indices, depth)
+    ray_stack = [(
+        ray_origins.copy(),
+        ray_directions.copy(),
+        np.ones((N, 3)),
+        np.arange(N),
+        0
+    )]
     
-    for depth in range(max_depth + 1):
-        if not np.any(active):
-            break
+    total_rays_processed = 0
+    
+    while ray_stack:
+        current_origins, current_directions, weights, pixel_indices, depth = ray_stack.pop()
+        
+        if depth > max_depth or len(pixel_indices) == 0:
+            continue
+        
+        M = len(pixel_indices)
+        total_rays_processed += M
         
         depth_start = time.time()
-        active_count = np.sum(active)
-        print(f"Depth {depth}: Processing {active_count} active rays...")
+        print(f"Depth {depth}: Processing {M} rays (stack size: {len(ray_stack)})...")
         
-        active_idx = np.where(active)[0]
+        # Find intersections
         t_values, surface_indices, normals = find_nearest_intersection_batch(
-            current_origins[active_idx],
-            current_directions[active_idx],
+            current_origins,
+            current_directions,
             surfaces
         )
         
-        hit_mask_local = surface_indices >= 0
-        miss_idx = active_idx[~hit_mask_local]
-        hit_idx = active_idx[hit_mask_local]
+        hit_mask = surface_indices >= 0
+        miss_mask = ~hit_mask
         
-        colors[miss_idx] += weights[miss_idx] * background_color
-        active[miss_idx] = False
+        # Rays that miss: add background color weighted
+        if np.any(miss_mask):
+            miss_pixels = pixel_indices[miss_mask]
+            final_colors[miss_pixels] += weights[miss_mask] * background_color
         
-        if len(hit_idx) == 0:
-            break
+        if not np.any(hit_mask):
+            print(f"  Depth {depth} completed in {time.time() - depth_start:.3f}s (no hits)")
+            continue
         
-        hit_t = t_values[hit_mask_local]
-        hit_surf_idx = surface_indices[hit_mask_local]
-        hit_normals = normals[hit_mask_local]
-        hit_origins = current_origins[hit_idx]
-        hit_directions = current_directions[hit_idx]
+        # Process hits
+        hit_idx = np.where(hit_mask)[0]
+        hit_t = t_values[hit_mask]
+        hit_surf_idx = surface_indices[hit_mask]
+        hit_normals = normals[hit_mask]
+        hit_origins = current_origins[hit_mask]
+        hit_directions = current_directions[hit_mask]
+        hit_weights = weights[hit_mask]
+        hit_pixels = pixel_indices[hit_mask]
         
         hit_points = hit_origins + hit_t[:, np.newaxis] * hit_directions
         hit_mat_idx = np.array([surfaces[si].material_index - 1 for si in hit_surf_idx])
         view_dirs = normalize_batch(hit_origins - hit_points)
         
-        M = len(hit_idx)
-        diffuse = np.zeros((M, 3))
-        specular = np.zeros((M, 3))
+        H = len(hit_idx)
+        diffuse = np.zeros((H, 3))
+        specular = np.zeros((H, 3))
         
+        # Compute lighting for each light
         for light in lights:
             light_pos = light.position
             light_color = light.color
@@ -518,9 +536,8 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
             light_dists = np.linalg.norm(to_light, axis=1)
             light_dirs = to_light / light_dists[:, np.newaxis]
             
-            shadow_hit_mask = np.ones(M, dtype=bool)
-            temp_mat_idx = np.zeros(M, dtype=np.int32)
-            temp_mat_idx[:] = hit_mat_idx
+            shadow_hit_mask = np.ones(H, dtype=bool)
+            temp_mat_idx = hit_mat_idx.copy()
             
             shadow_trans = compute_soft_shadow_batch(
                 hit_points + hit_normals * EPSILON,
@@ -530,10 +547,12 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
             
             light_intensity = (1 - light.shadow_intensity) + light.shadow_intensity * shadow_trans
             
+            # Diffuse
             n_dot_l = np.maximum(0, np.sum(hit_normals * light_dirs, axis=1))
             mat_diffuse = materials_array['diffuse'][hit_mat_idx]
             diffuse += mat_diffuse * light_color * (light_intensity * n_dot_l)[:, np.newaxis]
             
+            # Specular
             reflect_dirs = reflect_batch(-light_dirs, hit_normals)
             r_dot_v = np.maximum(0, np.sum(reflect_dirs * view_dirs, axis=1))
             
@@ -544,52 +563,56 @@ def render_vectorized(camera, scene_settings, materials, surfaces, lights, width
                            (light_intensity * np.power(r_dot_v, mat_shininess))[:, np.newaxis])
             specular += spec_contrib
         
+        # Get material properties
         mat_transparency = materials_array['transparency'][hit_mat_idx]
         mat_reflection = materials_array['reflection'][hit_mat_idx]
         
+        # Surface contribution: (diffuse + specular) * (1 - transparency)
         surface_color = (diffuse + specular) * (1 - mat_transparency)[:, np.newaxis]
-        colors[hit_idx] += weights[hit_idx] * surface_color
+        final_colors[hit_pixels] += hit_weights * surface_color
         
-        has_reflection = np.any(mat_reflection > EPSILON, axis=1)
-        reflect_idx = hit_idx[has_reflection]
+        # Spawn transparency rays (independent of reflection)
         has_transparency = mat_transparency > EPSILON
-        
-        no_recurse = ~has_reflection & ~has_transparency
-        active[hit_idx[no_recurse]] = False
-        
-        if len(reflect_idx) > 0 and depth < max_depth:
-            reflect_local_idx = np.where(has_reflection)[0]
-            reflect_dirs = reflect_batch(hit_directions[reflect_local_idx], 
-                                         hit_normals[reflect_local_idx])
-            reflect_origins = hit_points[reflect_local_idx] + hit_normals[reflect_local_idx] * EPSILON
+        if np.any(has_transparency) and depth < max_depth:
+            trans_idx = np.where(has_transparency)[0]
+            trans_origins = hit_points[trans_idx] - hit_normals[trans_idx] * EPSILON
+            trans_directions = hit_directions[trans_idx]
+            trans_weights = hit_weights[trans_idx] * mat_transparency[trans_idx, np.newaxis]
+            trans_pixels = hit_pixels[trans_idx]
             
-            current_origins[reflect_idx] = reflect_origins
-            current_directions[reflect_idx] = reflect_dirs
-            weights[reflect_idx] *= mat_reflection[reflect_local_idx]
-        else:
-            active[reflect_idx] = False
+            ray_stack.append((
+                trans_origins,
+                trans_directions,
+                trans_weights,
+                trans_pixels,
+                depth + 1
+            ))
         
-        trans_only = has_transparency & ~has_reflection
-        trans_only_idx = hit_idx[trans_only]
-        
-        if len(trans_only_idx) > 0 and depth < max_depth:
-            trans_local_idx = np.where(trans_only)[0]
-            trans_origins = hit_points[trans_local_idx] - hit_normals[trans_local_idx] * EPSILON
+        # Spawn reflection rays (independent of transparency)
+        has_reflection = np.any(mat_reflection > EPSILON, axis=1)
+        if np.any(has_reflection) and depth < max_depth:
+            refl_idx = np.where(has_reflection)[0]
+            refl_directions = reflect_batch(hit_directions[refl_idx], hit_normals[refl_idx])
+            refl_origins = hit_points[refl_idx] + hit_normals[refl_idx] * EPSILON
+            refl_weights = hit_weights[refl_idx] * mat_reflection[refl_idx]
+            refl_pixels = hit_pixels[refl_idx]
             
-            current_origins[trans_only_idx] = trans_origins
-            current_directions[trans_only_idx] = hit_directions[trans_local_idx]
-            weights[trans_only_idx] *= mat_transparency[trans_local_idx, np.newaxis]
-            active[trans_only_idx] = True
+            ray_stack.append((
+                refl_origins,
+                refl_directions,
+                refl_weights,
+                refl_pixels,
+                depth + 1
+            ))
         
         print(f"  Depth {depth} completed in {time.time() - depth_start:.3f}s")
     
-    image = colors.reshape((height, width, 3))
+    image = final_colors.reshape((height, width, 3))
     
     total_time = time.time() - start_time
-    print(f"Vectorized rendering complete in {total_time:.1f}s")
+    print(f"Vectorized rendering complete in {total_time:.1f}s ({total_rays_processed} total rays)")
     
     return image
-
 
 def save_image(image_array, output_path):
     image_array = np.clip(image_array, 0, 1)

@@ -6,35 +6,7 @@ class Sphere:
         self.position = np.array(position, dtype=np.float64)
         self.radius = radius
         self.material_index = material_index
-    
-    # def intersect(self, ray_origin, ray_direction):
-    #     """Compute ray-sphere intersection using the quadratic formula."""
-    #     oc = ray_origin - self.position
-        
-    #     a = np.dot(ray_direction, ray_direction)
-    #     b = 2.0 * np.dot(oc, ray_direction)
-    #     c = np.dot(oc, oc) - self.radius * self.radius
-        
-    #     discriminant = b * b - 4 * a * c
-        
-    #     if discriminant < 0:
-    #         return None, None
-        
-    #     sqrt_disc = np.sqrt(discriminant)
-    #     t1 = (-b - sqrt_disc) / (2 * a)
-    #     t2 = (-b + sqrt_disc) / (2 * a)
-        
-    #     if t1 > 1e-6:
-    #         t = t1
-    #     elif t2 > 1e-6:
-    #         t = t2
-    #     else:
-    #         return None, None
-        
-    #     hit_point = ray_origin + t * ray_direction
-    #     normal = (hit_point - self.position) / self.radius
-        
-    #     return t, normal
+
     
     def intersect(self, ray_origin, ray_direction):
         """Compute ray-sphere intersection using the quadratic formula."""
