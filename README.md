@@ -9,16 +9,6 @@ pip install -r requirements.txt
 python ray_tracer.py scenes/pool.txt output/pool.png --width 500 --height 500
 ```
 
-## Features
-
-- Spheres, infinite planes, axis-aligned cubes
-- Phong shading (diffuse + specular)
-- Soft shadows with NxN jittered sampling
-- Recursive reflections
-- Transparency with light transmission
-
----
-
 ## Project Structure
 
 ```
@@ -103,6 +93,20 @@ def intersect_batch(ray_origins, ray_directions):
 
 ---
 
+## Usage
+
+```bash
+python ray_tracer.py <scene_file> <output_image> [options]
+```
+
+| Option | Description |
+|--------|-------------|
+| `--width N` | Image width (default: 500) |
+| `--height N` | Image height (default: 500) |
+| `--sequential` | Original pixel-by-pixel |
+
+---
+
 ## Performance
 
 500x500 image, pool.txt scene:
@@ -114,67 +118,3 @@ def intersect_batch(ray_origins, ray_directions):
 
 ---
 
-## Usage
-
-```bash
-python ray_tracer.py <scene_file> <output_image> [options]
-```
-
-| Option | Description |
-|--------|-------------|
-| `--width N` | Image width (default: 500) |
-| `--height N` | Image height (default: 500) |
-| `--vectorized` | Single-threaded vectorized (default)|
-| `--sequential` | Original pixel-by-pixel |
-
----
-
-## Project Structure
-
-```
-raytracer/
-  ray_tracer.py       # Render loops, shading, shadows
-  camera.py           # Ray generation
-  light.py            # Point light
-  material.py         # Material properties
-  scene_settings.py   # Background, shadow rays, max depth
-  surfaces/
-    sphere.py         # Sphere intersection
-    infinite_plane.py # Plane intersection
-    cube.py           # Cube intersection (slab method)
-  scenes/
-    pool.txt          # Example scene
-  output/             # Rendered images
-```
-
----
-
-## Scene File Format
-
-```
-cam   0 1 -3   0 0 0   0 1 0   2 2
-set   0.5 0.7 1.0   5   3
-mtl   0.8 0.2 0.2   1 1 1   0.3 0.3 0.3   50   0
-sph   0 0 0   0.5   1
-pln   0 1 0   -0.5   2
-box   1 0 0   0.5   3
-lgt   2 3 -2   1 1 1   1   0.8   0.5
-```
-
-| Line | Format |
-|------|--------|
-| cam | position, look-at, up, screen_dist, screen_width |
-| set | bg_color, shadow_rays, max_recursion |
-| mtl | diffuse, specular, reflection, shininess, transparency |
-| sph | center, radius, material_idx |
-| pln | normal, offset, material_idx |
-| box | center, edge_length, material_idx |
-| lgt | position, color, spec_intensity, shadow_intensity, radius |
-
----
-
-## Dependencies
-
-```bash
-pip install numpy pillow
-```

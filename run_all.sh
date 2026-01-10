@@ -38,7 +38,7 @@ for scene_file in scenes/*.txt; do
     
     seq_output="output/${scene_name}_seq_${seq_w}_${seq_h}.png"
     echo "Running sequential: ${seq_w}x${seq_h}"
-    # python ray_tracer.py "$scene_file" "$seq_output" --width "$seq_w" --height "$seq_h" --sequential
+    python ray_tracer.py "$scene_file" "$seq_output" --width "$seq_w" --height "$seq_h" --sequential
     
     # Get another random size for vectorized if sequential got 500x500
     if [ $fixed_run -eq 0 ]; then
